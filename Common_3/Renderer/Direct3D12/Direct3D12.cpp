@@ -6375,5 +6375,137 @@ void cmdUpdateVirtualTexture(Cmd* cmd, Texture* pTexture)
 		fillVirtualTexture(cmd, pTexture, NULL);
 	}
 }
+
+void cmdReadbackResource(Cmd* pCmd, ResourceReadback* pRequest)
+{
+    ASSERT(pCmd);
+    ASSERT(pRequest);
+    ASSERT(pRequest->pSrcBuffer || pRequest->pSrcTexture);
+    ASSERT(pRequest->pDestBuffer);
+    ASSERT(pRequest->pDestBuffer->mMemoryUsage == RESOURCE_MEMORY_USAGE_GPU_TO_CPU);
+    
+    if (pRequest->pSrcBuffer && TinyImageFormat_IsCompressed((TinyImageFormat)pRequest->pSrcTexture->mFormat))
+    {
+        LOGF(eERROR, "Cannot readback compressed textures");
+        return;
+    }
+
+    if (pRequest->sType == RESOURCE_READBACK_BUFFER)
+    {
+        ASSERT(pRequest->mBufferReadOffset + pRequest->mBufferReadBytes <= pRequest->pSrcBuffer->mSize);
+        pCmd->pDxCmdList->CopyBufferRegion(pRequest->pDestBuffer->pDxResource, 0, pRequest->pSrcBuffer->pDxResource, pRequest->mBufferReadOffset, 
+            pRequest->mBufferReadBytes == UINT_MAX ? pRequest->pSrcBuffer->mSize : pRequest->mBufferReadBytes);
+    }
+    else
+    {
+        D3D12_TEXTURE_COPY_LOCATION locDest = { };
+        locDest.Type = D3D12_TEXTURE_COPY_TYPE::D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        locDest.pResource = pRequest->pDestBuffer->pDxResource;
+        
+        D3D12_RESOURCE_DESC srcDesc = pRequest->pSrcTexture->pDxResource->GetDesc();
+        pCmd->pRenderer->pDxDevice->GetCopyableFootprints(
+            &srcDesc,
+            0, 1, //SUBRESOURCE_INDEX(pRequest->mLevel, pRequest->mLayer, 0, pRequest->pSrcTexture->mMipLevels, pRequest->pSrcTexture->mArraySizeMinusOne+1), 1,
+            0, &locDest.PlacedFootprint, NULL, NULL, NULL);
+
+        D3D12_TEXTURE_COPY_LOCATION locSrc = { };
+        locSrc.Type = D3D12_TEXTURE_COPY_TYPE::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        locSrc.SubresourceIndex = SUBRESOURCE_INDEX(pRequest->mLevel, pRequest->mLayer, 0, pRequest->pSrcTexture->mMipLevels, pRequest->pSrcTexture->mArraySizeMinusOne + 1);
+        locSrc.pResource = pRequest->pSrcTexture->pDxResource;
+
+        D3D12_BOX box = { };
+        box.right = 8;
+        box.bottom = 8;
+        box.top = 0;
+        box.back = 1;
+        pCmd->pDxCmdList->CopyTextureRegion(&locDest, 0, 0, 0, &locSrc, NULL);
+    }
+}
+
+bool getReadbackData(Renderer* pRenderer, ResourceReadback* pRequest, void* pMapAddress, uint64_t bufferSize)
+{
+    ASSERT(pRenderer);
+    ASSERT(pRequest);
+    ASSERT(pMapAddress);
+
+    if (pRequest->pSrcTexture && TinyImageFormat_IsCompressed((TinyImageFormat)pRequest->pSrcTexture->mFormat))
+    {
+        LOGF(eERROR, "Cannot readback compressed textures, provided format is %s", TinyImageFormat_Name((TinyImageFormat)pRequest->pSrcTexture->mFormat));
+        return false;
+    }
+
+    bool successfulRead = false;
+    bool mappedHere = false;
+
+    // attempt to map if not persistently mapped
+    if (pRequest->pDestBuffer->pCpuMappedAddress == NULL)
+    {
+        mapBuffer(pRenderer, pRequest->pDestBuffer, NULL);
+        mappedHere = true;
+    }
+
+    if (pRequest->pDestBuffer->pCpuMappedAddress)
+    {
+        if (pRequest->sType == RESOURCE_READBACK_TEXTURE)
+        {
+            uint32_t placedRowCount = 0;
+
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footPrint = { };
+            D3D12_RESOURCE_DESC srcDesc = pRequest->pSrcTexture->pDxResource->GetDesc();
+            pRenderer->pDxDevice->GetCopyableFootprints(&srcDesc,
+                SUBRESOURCE_INDEX(pRequest->mLevel, pRequest->mLayer, 0, pRequest->pSrcTexture->mMipLevels, pRequest->pSrcTexture->mArraySizeMinusOne + 1), 1 /* num SubRs */,
+                0, &footPrint, &placedRowCount, NULL, NULL);
+
+            const uint32_t mipWidth = footPrint.Footprint.Width;
+            const uint32_t mipHeight = footPrint.Footprint.Height;
+            const uint32_t mipDepth = footPrint.Footprint.Depth;
+
+            const uint32_t blockBitSize = TinyImageFormat_BitSizeOfBlock((TinyImageFormat)pRequest->pSrcTexture->mFormat);
+            const uint32_t cpuRowSize = (blockBitSize * mipWidth) / 8u /* byte */;
+
+            uint64_t bytesRead = 0;
+            for (uint32_t z = 0; z < footPrint.Footprint.Depth; ++z)
+            {
+                for (uint32_t row = 0; row < placedRowCount && bytesRead + cpuRowSize <= bufferSize; ++row, bytesRead += cpuRowSize)
+                {
+                    memcpy((unsigned char*)pMapAddress + (z * cpuRowSize * mipHeight) + (row * cpuRowSize), 
+                        (unsigned char*)pRequest->pDestBuffer->pCpuMappedAddress + (z * mipHeight * footPrint.Footprint.RowPitch) + (row * footPrint.Footprint.RowPitch), 
+                        cpuRowSize);
+                }
+            }
+        }
+        else
+            memcpy(pMapAddress, pRequest->pDestBuffer->pCpuMappedAddress, min<size_t>(bufferSize, pRequest->pDestBuffer->mSize));
+        
+        successfulRead = true;
+    }
+
+    if (mappedHere)
+        unmapBuffer(pRenderer, pRequest->pDestBuffer);
+
+    return successfulRead;
+}
+
+void freeReadback(ResourceReadback* pRequest)
+{
+    ASSERT(pRequest);
+    // D3D12 has nothing to do
+}
+
+uint64_t getTextureReadbackSize(Renderer* pRenderer, Texture* pReadingTexture, uint32_t mipLevel, uint32_t layer)
+{
+    ASSERT(pRenderer);
+    ASSERT(pReadingTexture);
+    ASSERT(pReadingTexture->pDxResource);
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footPrint = { };
+    D3D12_RESOURCE_DESC srcDesc = pReadingTexture->pDxResource->GetDesc();
+    pRenderer->pDxDevice->GetCopyableFootprints(&srcDesc,
+        SUBRESOURCE_INDEX(mipLevel, layer, 0, pReadingTexture->mMipLevels, pReadingTexture->mArraySizeMinusOne + 1), 1 /* num SubRs */,
+        0, &footPrint, NULL, NULL, NULL);
+
+    return footPrint.Footprint.RowPitch * footPrint.Footprint.Height * footPrint.Footprint.Depth;
+}
+
 #endif
 #endif

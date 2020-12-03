@@ -2385,6 +2385,9 @@ typedef struct CommandSignature
 	IndirectArgumentType    mDrawType;
 	uint32_t                mStride;
 #endif
+#if defined(DIRECT3D11)
+    IndirectArgumentType    mDrawType;
+#endif
 } CommandSignature;
 
 typedef struct DescriptorSetDesc

@@ -230,6 +230,37 @@ typedef struct TextureUpdateDesc
 	} mInternal;
 } TextureUpdateDesc;
 
+typedef enum ResourceReadbackType
+{
+    RESOURCE_READBACK_BUFFER = 0,
+    RESOURCE_READBACK_TEXTURE = 1
+} ResourceReadbackType;
+
+/// #NOTE: Readbacks are only intended for use with UAV buffers and textures of primitive formats (not compressed/planed/etc) such R8G8B8A8, R32F, etc.
+typedef struct ResourceReadback
+{
+    ResourceReadbackType    sType;
+    /// One of pSrcBuffer or pSrcTexture must be filled out to readback the respective object.
+    union {
+        Buffer*                 pSrcBuffer;
+        Texture*                pSrcTexture;
+    };
+    /// When reading back a buffer it will be offset by mBufferReadOffset bytes.
+    uint32_t                mBufferReadOffset;
+    /// When reading back a buffer only mBufferReadBytes will be read (starting at mBufferReadOffset's position).
+    uint32_t                mBufferReadBytes;
+    /// Miplevel of a texture resource to read.
+    uint32_t                mLevel;
+    /// layer/cube-face of a texture resource to read.
+    uint32_t                mLayer;
+    /// Required on D3D12 and Vulkan, only required by D3D11 when reading back a buffer.
+    Buffer*                 pDestBuffer;
+#if defined(DIRECT3D11)
+    /// D3D11 needs to create a staging texture to copy a texture subresource, needs to stay alive for duration of query.
+    ID3D11Resource* pStagingResource;
+#endif
+} ResourceReadback;
+
 typedef enum ShaderStageLoadFlags
 {
 	SHADER_STAGE_LOAD_FLAG_NONE = 0x0,
@@ -302,6 +333,21 @@ void endUpdateResource(TextureUpdateDesc* pTexture, SyncToken* token);
 void removeResource(Buffer* pBuffer);
 void removeResource(Texture* pTexture);
 void removeResource(Geometry* pGeom);
+
+// MARK: readbackResource
+
+/// Resource readback must first execute on a command queue and may later be accessed with getReadbackData
+/// once certain the readback has been completed.
+/// For Direct3D11 the ResourceReadback object will manage it's staging texture which must be freed with a call to freeReadback.
+/// The readback can be executed on a cmd-list (in graphics queue most likely) or queued to the copy-engine. 
+/// Copy-engine/queueing is preferred unless there's a reason to block.
+/// Use getTextureReadbackSize to get a required minimum buffer size to complete the readback on platforms that write into a buffer.
+
+void queueReadbackResource(ResourceReadback* pRequestDesc, SyncToken* token);
+void cmdReadbackResource(Cmd* pCmd, ResourceReadback* pRequestDesc);
+bool getReadbackData(Renderer* pRenderer, ResourceReadback* pRequestDesc, void* pMapAddress, uint64_t bufferSize);
+void freeReadback(ResourceReadback* pRequestDesc);
+uint64_t getTextureReadbackSize(Renderer* pRenderer, Texture* pReadingTexture, uint32_t mipLevel, uint32_t layer);
 
 // MARK: Waiting for Loads
 

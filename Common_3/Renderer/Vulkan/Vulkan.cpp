@@ -61,6 +61,7 @@
 #endif
 
 #include "../IRenderer.h"
+#include "../IResourceLoader.h"
 
 #include "../../ThirdParty/OpenSource/EASTL/functional.h"
 #include "../../ThirdParty/OpenSource/EASTL/sort.h"
@@ -7595,6 +7596,97 @@ void cmdUpdateVirtualTexture(Cmd* cmd, Texture* pTexture)
 		releasePage(cmd, pTexture);
 		fillVirtualTexture(cmd, pTexture, NULL);
 	}
+}
+
+void cmdReadbackResource(Cmd* pCmd, ResourceReadback* pRequest)
+{
+    ASSERT(pCmd);
+    ASSERT(VK_NULL_HANDLE != pCmd->pVkCmdBuf);
+    ASSERT(pRequest);
+    ASSERT(pRequest->pSrcBuffer || pRequest->pSrcTexture);
+    ASSERT(pRequest->pDestBuffer);
+    ASSERT(pRequest->pDestBuffer->mMemoryUsage == RESOURCE_MEMORY_USAGE_GPU_TO_CPU);
+
+    if (pRequest->pSrcTexture && TinyImageFormat_IsCompressed((TinyImageFormat)pRequest->pSrcTexture->mFormat))
+    {
+        LOGF(eERROR, "Cannot readback compressed textures, provided format is %s", TinyImageFormat_Name((TinyImageFormat)pRequest->pSrcTexture->mFormat));
+        return;
+    }
+
+    if (pRequest->sType == RESOURCE_READBACK_BUFFER)
+    {
+        VkBufferCopy cpy = { };
+        cpy.srcOffset = pRequest->mBufferReadOffset;
+        cpy.size = pRequest->mBufferReadBytes;
+        ASSERT(pRequest->mBufferReadOffset + pRequest->mBufferReadBytes <= pRequest->pSrcBuffer->mSize);
+        vkCmdCopyBuffer(pCmd->pVkCmdBuf, pRequest->pSrcBuffer->pVkBuffer, pRequest->pDestBuffer->pVkBuffer, 1, &cpy);
+    }
+    else
+    {
+        VkBufferImageCopy cpy = { };
+        cpy.imageExtent.width = max(1u, (uint32_t)(pRequest->pSrcTexture->mWidth >> pRequest->mLevel));
+        cpy.imageExtent.height = max(1u, (uint32_t)(pRequest->pSrcTexture->mHeight >> pRequest->mLevel));
+        cpy.imageExtent.depth = max(1u, (uint32_t)(pRequest->pSrcTexture->mDepth >> pRequest->mLevel));
+        cpy.imageSubresource.mipLevel = pRequest->mLevel;
+        cpy.imageSubresource.baseArrayLayer = pRequest->mLayer;
+        cpy.imageSubresource.layerCount = 1;
+        cpy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vkCmdCopyImageToBuffer(pCmd->pVkCmdBuf, pRequest->pSrcTexture->pVkImage, util_to_vk_image_layout(RESOURCE_STATE_COPY_SOURCE), pRequest->pDestBuffer->pVkBuffer, 1, &cpy);
+    }
+}
+
+bool getReadbackData(Renderer* pRenderer, ResourceReadback* pRequest, void* pMapAddress, uint64_t bufferSize)
+{
+    ASSERT(pRenderer);
+    ASSERT(pRequest);
+    ASSERT(pRequest->pDestBuffer);
+    ASSERT(pMapAddress);
+
+    if (pRequest->pSrcBuffer && TinyImageFormat_IsCompressed((TinyImageFormat)pRequest->pSrcTexture->mFormat))
+    {
+        LOGF(eERROR, "Cannot readback compressed textures");
+        return false;
+    }
+
+    bool success = false;
+    bool mappedHere = false;
+
+    if (pRequest->pDestBuffer->pCpuMappedAddress == NULL)
+    {
+        mapBuffer(pRenderer, pRequest->pDestBuffer, NULL);
+        mappedHere = true;
+    }
+
+    if (pRequest->pDestBuffer->pCpuMappedAddress)
+    {
+        memcpy(pMapAddress, pRequest->pDestBuffer->pCpuMappedAddress, min<size_t>(bufferSize, pRequest->pDestBuffer->mSize));
+        success = true;
+    }
+
+    if (mappedHere)
+        unmapBuffer(pRenderer, pRequest->pDestBuffer);
+
+    return success;
+}
+
+void freeReadback(ResourceReadback* pRequest)
+{
+    ASSERT(pRequest);
+    // nothing to do for Vulkan
+}
+
+uint64_t getTextureReadbackSize(Renderer* pRenderer, Texture* pReadingTexture, uint32_t mipLevel, uint32_t layer)
+{
+    ASSERT(pRenderer);
+    ASSERT(pReadingTexture);
+    ASSERT(pReadingTexture->pVkImage);
+
+    const uint32_t mipWidth = max(1u, (uint32_t)(pReadingTexture->mWidth >> mipLevel));
+    const uint32_t mipHeight = max(1u, (uint32_t)(pReadingTexture->mHeight >> mipLevel));
+    const uint32_t mipDepth = max(1u, (uint32_t)(pReadingTexture->mDepth >> mipLevel));
+    const uint32_t blockByteSize = TinyImageFormat_BitSizeOfBlock((TinyImageFormat)pReadingTexture->mFormat) / 8u;
+
+    return mipDepth * mipHeight * mipWidth * blockByteSize;
 }
 
 #endif

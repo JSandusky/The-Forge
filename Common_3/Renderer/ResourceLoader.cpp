@@ -355,6 +355,7 @@ typedef enum UpdateRequestType
 	UPDATE_REQUEST_TEXTURE_BARRIER,
 	UPDATE_REQUEST_LOAD_TEXTURE,
 	UPDATE_REQUEST_LOAD_GEOMETRY,
+    UPDATE_REQUEST_READBACK,
 	UPDATE_REQUEST_INVALID,
 } UpdateRequestType;
 
@@ -373,10 +374,12 @@ struct UpdateRequest
 	UpdateRequest(const GeometryLoadDesc& geom) :             mType(UPDATE_REQUEST_LOAD_GEOMETRY), geomLoadDesc(geom) {}
 	UpdateRequest(const BufferBarrier& barrier) :             mType(UPDATE_REQUEST_BUFFER_BARRIER), bufferBarrier(barrier) {}
 	UpdateRequest(const TextureBarrier& barrier) :            mType(UPDATE_REQUEST_TEXTURE_BARRIER), textureBarrier(barrier) {}
+    UpdateRequest(ResourceReadback* readback) :               mType(UPDATE_REQUEST_READBACK), pReadback(readback) {}
 
 	UpdateRequestType             mType = UPDATE_REQUEST_INVALID;
 	uint64_t                      mWaitIndex = 0;
 	Buffer*                       pUploadBuffer = NULL;
+    ResourceReadback*             pReadback = NULL;
 	union
 	{
 		BufferUpdateDesc          bufUpdateDesc;
@@ -1590,6 +1593,10 @@ static void streamerThreadFunc(void* pThreadData)
 				case UPDATE_REQUEST_LOAD_GEOMETRY:
 					result = loadGeometry(pLoader->pRenderer, &copyEngine, pLoader->mNextSet, updateState);
 					break;
+                case UPDATE_REQUEST_READBACK:
+                    cmdReadbackResource(acquireCmd(&copyEngine, pLoader->mNextSet), updateState.pReadback);
+                    result = UPLOAD_FUNCTION_RESULT_COMPLETED;
+                    break;
 				case UPDATE_REQUEST_INVALID:
 					break;
 				}
@@ -3049,5 +3056,21 @@ void savePipelineCache(Renderer* pRenderer, PipelineCache* pPipelineCache, Pipel
 	}
 #endif
 }
+
+void queueReadbackResource(ResourceReadback* pRequest, SyncToken* token)
+{
+    uint32_t nodeIndex = pRequest->sType == RESOURCE_READBACK_BUFFER ? (uint32_t)pRequest->pSrcBuffer->mNodeIndex : pRequest->pSrcTexture->mNodeIndex;
+    pResourceLoader->mQueueMutex.Acquire();
+
+    SyncToken t = tfrg_atomic64_add_relaxed(&pResourceLoader->mTokenCounter, 1) + 1;
+
+    pResourceLoader->mRequestQueue[nodeIndex].emplace_back(UpdateRequest(pRequest));
+    pResourceLoader->mRequestQueue[nodeIndex].back().mWaitIndex = t;
+    pResourceLoader->mQueueMutex.Release();
+    pResourceLoader->mQueueCond.WakeOne();
+    if (token)
+        *token = max(t, *token);
+}
+
 /************************************************************************/
 /************************************************************************/

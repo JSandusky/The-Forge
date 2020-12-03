@@ -29,7 +29,11 @@ enum CmdType
 	CMD_TYPE_cmdEndDebugMarker,
 	CMD_TYPE_cmdAddDebugMarker,
 	CMD_TYPE_cmdUpdateBuffer,
-	CMD_TYPE_cmdUpdateSubresource
+	CMD_TYPE_cmdUpdateSubresource,
+    CMD_TYPE_cmdDrawIndirectInstanced,
+    CMD_TYPE_cmdDrawIndirectIndexedInstanced,
+    CMD_TYPE_cmdDispatchIndirect,
+    CMD_TYPE_cmdCopySubresource
 };
 
 struct BindRenderTargetsCmd
@@ -228,6 +232,22 @@ struct UpdateSubresourcesCmd
 	SubresourceDataDesc mSubresourceDesc;
 };
 
+struct DrawIndirectCmd {
+    Buffer*             pArgsBuffer;
+    uint32_t            pArgsOffset;
+};
+
+struct CopySubresourceCmd {
+    ID3D11Resource*     pSrcResource;
+    ID3D11Resource*     pDestResource;
+    uint32_t            mLevel;
+    uint32_t            mLevelCount;
+    uint32_t            mLayer;
+    uint32_t            mDimX;
+    uint32_t            mDimY;
+    uint32_t            mDimZ;
+};
+
 struct CachedCmd
 {
 	Cmd*    pCmd;
@@ -255,5 +275,7 @@ struct CachedCmd
 		AddDebugMarkerCmd       mAddDebugMarkerCmd;
 		UpdateBufferCmd         mUpdateBufferCmd;
 		UpdateSubresourcesCmd   mUpdateSubresourcesCmd;
+        DrawIndirectCmd         mDrawIndirectCmd;
+        CopySubresourceCmd      mCopySubresourceCmd;
 	};
 };

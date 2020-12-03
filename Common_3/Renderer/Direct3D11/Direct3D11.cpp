@@ -4238,6 +4238,34 @@ void queueSubmit(
 					}
 					break;
 				}
+                case CMD_TYPE_cmdDrawIndirectInstanced:
+                {
+                    if (cmd.mDrawIndirectCmd.pArgsBuffer && cmd.mDrawIndirectCmd.pArgsBuffer->pDxResource)
+                        pContext->DrawInstancedIndirect(cmd.mDrawIndirectCmd.pArgsBuffer->pDxResource, cmd.mDrawIndirectCmd.pArgsOffset);
+                    break;
+                }
+                case CMD_TYPE_cmdDrawIndirectIndexedInstanced:
+                {
+                    if (cmd.mDrawIndirectCmd.pArgsBuffer && cmd.mDrawIndirectCmd.pArgsBuffer->pDxResource)
+                        pContext->DrawIndexedInstancedIndirect(cmd.mDrawIndirectCmd.pArgsBuffer->pDxResource, cmd.mDrawIndirectCmd.pArgsOffset);
+                    break;
+                }
+                case CMD_TYPE_cmdDispatchIndirect:
+                {
+                    if (cmd.mDrawIndirectCmd.pArgsBuffer && cmd.mDrawIndirectCmd.pArgsBuffer->pDxResource)
+                        pContext->DispatchIndirect(cmd.mDrawIndirectCmd.pArgsBuffer->pDxResource, cmd.mDrawIndirectCmd.pArgsOffset);
+                    break;
+                }
+                case CMD_TYPE_cmdCopySubresource:
+                {
+                    D3D11_BOX box = { };
+                    box.right = cmd.mCopySubresourceCmd.mDimX;
+                    box.bottom = cmd.mCopySubresourceCmd.mDimY;
+                    box.back = cmd.mCopySubresourceCmd.mDimZ;
+                    pContext->CopySubresourceRegion(cmd.mCopySubresourceCmd.pDestResource, 0, 0, 0, 0, 
+                        cmd.mCopySubresourceCmd.pSrcResource, D3D11CalcSubresource(cmd.mCopySubresourceCmd.mLevel, cmd.mCopySubresourceCmd.mLayer, cmd.mCopySubresourceCmd.mLevelCount), &box);
+                    break;
+                }
 				default: break;
 			}
 		}
@@ -4320,14 +4348,70 @@ TinyImageFormat getRecommendedSwapchainFormat(bool hintHDR)
 /************************************************************************/
 // Indirect Draw functions
 /************************************************************************/
-void addIndirectCommandSignature(Renderer* pRenderer, const CommandSignatureDesc* pDesc, CommandSignature** ppCommandSignature) {}
+void addIndirectCommandSignature(Renderer* pRenderer, const CommandSignatureDesc* pDesc, CommandSignature** ppCommandSignature) 
+{
+    ASSERT(pDesc);
+    ASSERT(pDesc->mIndirectArgCount == 1);
+    ASSERT(ppCommandSignature);
 
-void removeIndirectCommandSignature(Renderer* pRenderer, CommandSignature* pCommandSignature) {}
+    CommandSignature* sig = nullptr;
+    if (pDesc->mIndirectArgCount == 1)
+    {
+        switch (pDesc->pArgDescs[0].mType)
+        {
+        case INDIRECT_DRAW:
+            sig = (CommandSignature*)tf_calloc(1, sizeof(CommandSignature));
+            sig->mDrawType = INDIRECT_DRAW;
+            break;
+        case INDIRECT_DRAW_INDEX:
+            sig = (CommandSignature*)tf_calloc(1, sizeof(CommandSignature));
+            sig->mDrawType = INDIRECT_DRAW_INDEX;
+            break;
+        case INDIRECT_DISPATCH:
+            sig = (CommandSignature*)tf_calloc(1, sizeof(CommandSignature));
+            sig->mDrawType = INDIRECT_DISPATCH;
+            break;
+        default:
+            LOGF(eERROR, "DX11 only supports draw, draw_index, and dispatch indirect commands");
+            break;
+        }
+    }
+
+    *ppCommandSignature = sig;
+}
+
+void removeIndirectCommandSignature(Renderer* pRenderer, CommandSignature* pCommandSignature) 
+{
+    ASSERT(pCommandSignature);
+
+    if (pCommandSignature)
+        SAFE_FREE(pCommandSignature);
+}
 
 void cmdExecuteIndirect(
 	Cmd* pCmd, CommandSignature* pCommandSignature, uint maxCommandCount, Buffer* pIndirectBuffer, uint64_t bufferOffset,
 	Buffer* pCounterBuffer, uint64_t counterBufferOffset)
 {
+    ASSERT(pCommandSignature && "Command signature required to identify indirect command to execute");
+    ASSERT(pIndirectBuffer && "Indirect arguments buffer required");
+    ASSERT(pCounterBuffer == nullptr && "Counter buffers not supported in DX11");
+
+    CachedCmds::iterator cachedCmdsIter = gCachedCmds.find(pCmd);
+    CachedCmd cmd = { };
+    switch (pCommandSignature->mDrawType)
+    {
+    case INDIRECT_DISPATCH:
+        cmd.sType = CMD_TYPE_cmdDispatchIndirect;
+        break;
+    case INDIRECT_DRAW:
+        cmd.sType = CMD_TYPE_cmdDrawIndirectInstanced;
+        break;
+    case INDIRECT_DRAW_INDEX:
+        cmd.sType = CMD_TYPE_cmdDrawIndirectIndexedInstanced;
+        break;
+    }
+    cmd.mDrawIndirectCmd.pArgsBuffer = pIndirectBuffer;
+    cachedCmdsIter->second.push_back(cmd);
 }
 /************************************************************************/
 // GPU Query Implementation
@@ -4590,5 +4674,231 @@ void setRenderTargetName(Renderer* pRenderer, RenderTarget* pRenderTarget, const
 void setPipelineName(Renderer*, Pipeline*, const char*)
 {
 }
+
+void cmdReadbackResource(Cmd* pCmd, ResourceReadback* pRequest)
+{
+    ASSERT(pCmd);
+    ASSERT(pRequest);
+    ASSERT(pRequest->pSrcBuffer || pRequest->pSrcTexture);
+
+    if (pRequest->pSrcBuffer && TinyImageFormat_IsCompressed((TinyImageFormat)pRequest->pSrcTexture->mFormat))
+    {
+        LOGF(eERROR, "Cannot readback compressed textures");
+        return;
+    }
+
+    CachedCmds::iterator cachedCmdsIter = gCachedCmds.find(pCmd);
+
+    if (pRequest->sType == RESOURCE_READBACK_BUFFER)
+    {
+        ASSERT(pRequest->mBufferReadOffset + pRequest->mBufferReadBytes <= pRequest->pSrcBuffer->mSize);
+
+        DECLARE_ZERO(CachedCmd, cmd);
+        cmd.sType = CMD_TYPE_cmdCopySubresource;
+        cmd.mCopySubresourceCmd.pSrcResource = pRequest->pSrcBuffer->pDxResource;
+        cmd.mCopySubresourceCmd.pDestResource = pRequest->pDestBuffer->pDxResource;
+        cmd.mCopySubresourceCmd.mDimX = pRequest->mBufferReadBytes;
+        cmd.mCopySubresourceCmd.mDimY = 1;
+        cmd.mCopySubresourceCmd.mDimZ = 1;
+        cachedCmdsIter->second.push_back(cmd);
+    }
+    else
+    {
+        DECLARE_ZERO(CachedCmd, cmd);
+        cmd.sType = CMD_TYPE_cmdCopySubresource;
+
+        D3D11_RESOURCE_DIMENSION texType;
+        pRequest->pSrcTexture->pDxResource->GetType(&texType);
+        
+#define MIPLEVEL_DIM(DIM, LEVEL, NUM_LEVELS) (max<uint32_t>((DIM) >> (LEVEL), 1u))
+
+        ID3D11Resource* staging = nullptr;
+        switch (texType)
+        {
+            case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+            {
+                ID3D11Texture1D* tex = ((ID3D11Texture1D*)pRequest->pSrcTexture->pDxResource);
+                DECLARE_ZERO(D3D11_TEXTURE1D_DESC, texDesc);
+                tex->GetDesc(&texDesc);
+                texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                texDesc.Usage = D3D11_USAGE_STAGING;
+                texDesc.BindFlags = 0;
+                texDesc.ArraySize = 1;
+                texDesc.Width = MIPLEVEL_DIM(texDesc.Width, pRequest->mLevel, texDesc.MipLevels);
+                texDesc.MipLevels = 1;
+
+                cmd.mCopySubresourceCmd.mDimX = texDesc.Width;
+                cmd.mCopySubresourceCmd.mDimY = 1;
+                cmd.mCopySubresourceCmd.mDimZ = 1;
+                
+                ID3D11Texture1D* stageTex = nullptr;
+                CHECK_HRESULT_DEVICE(pCmd->pRenderer->pDxDevice, pCmd->pRenderer->pDxDevice->CreateTexture1D(&texDesc, nullptr, &stageTex));
+                pRequest->pStagingResource = stageTex;
+                break;
+            }
+            case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+            {
+                ID3D11Texture2D* tex = ((ID3D11Texture2D*)pRequest->pSrcTexture->pDxResource);
+                DECLARE_ZERO(D3D11_TEXTURE2D_DESC, texDesc);
+                tex->GetDesc(&texDesc);
+                texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                texDesc.Usage = D3D11_USAGE_STAGING;
+                texDesc.BindFlags = 0;
+                texDesc.ArraySize = 1;
+                texDesc.SampleDesc.Count = 1;
+                texDesc.SampleDesc.Quality = 0;
+                texDesc.Width = MIPLEVEL_DIM(texDesc.Width, pRequest->mLevel, texDesc.MipLevels);
+                texDesc.Height = MIPLEVEL_DIM(texDesc.Height, pRequest->mLevel, texDesc.MipLevels);
+                texDesc.MipLevels = 1;
+
+                cmd.mCopySubresourceCmd.mDimX = texDesc.Width;
+                cmd.mCopySubresourceCmd.mDimY = texDesc.Height;
+                cmd.mCopySubresourceCmd.mDimZ = 1;
+
+                ID3D11Texture2D* stageTex = nullptr;
+                CHECK_HRESULT_DEVICE(pCmd->pRenderer->pDxDevice, pCmd->pRenderer->pDxDevice->CreateTexture2D(&texDesc, nullptr, &stageTex));
+                pRequest->pStagingResource = stageTex;
+                break;
+            }
+            case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+            {
+                ID3D11Texture3D* tex = ((ID3D11Texture3D*)pRequest->pSrcTexture->pDxResource);
+                DECLARE_ZERO(D3D11_TEXTURE3D_DESC, texDesc);
+                tex->GetDesc(&texDesc);
+                texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                texDesc.Usage = D3D11_USAGE_STAGING;
+                texDesc.BindFlags = 0;
+                texDesc.Width = MIPLEVEL_DIM(texDesc.Width, pRequest->mLevel, texDesc.MipLevels);
+                texDesc.Height = MIPLEVEL_DIM(texDesc.Height, pRequest->mLevel, texDesc.MipLevels);
+                texDesc.Depth = MIPLEVEL_DIM(texDesc.Depth, pRequest->mLevel, texDesc.MipLevels);
+                texDesc.MipLevels = 1;
+
+                cmd.mCopySubresourceCmd.mDimX = texDesc.Width;
+                cmd.mCopySubresourceCmd.mDimY = texDesc.Height;
+                cmd.mCopySubresourceCmd.mDimZ = texDesc.Depth;
+
+                ID3D11Texture3D* stageTex = nullptr;
+                CHECK_HRESULT_DEVICE(pCmd->pRenderer->pDxDevice, pCmd->pRenderer->pDxDevice->CreateTexture3D(&texDesc, nullptr, &stageTex));
+                pRequest->pStagingResource = stageTex;
+                break;
+            }
+        }
+
+        ASSERT(pRequest->pStagingResource);
+
+        cmd.mCopySubresourceCmd.pSrcResource = pRequest->pSrcTexture->pDxResource;
+        cmd.mCopySubresourceCmd.pDestResource = pRequest->pStagingResource;
+        cmd.mCopySubresourceCmd.mLevel = pRequest->mLevel;
+        cmd.mCopySubresourceCmd.mLayer = pRequest->mLayer;
+        cmd.mCopySubresourceCmd.mLevelCount = pRequest->pSrcTexture->mMipLevels;
+
+        cachedCmdsIter->second.push_back(cmd);
+    }
+}
+
+bool getReadbackData(Renderer* pRenderer, ResourceReadback* pRequest, void* pMapAddress, uint64_t bufferSize)
+{
+    ASSERT(pRenderer);
+    ASSERT(pRequest);
+    ASSERT(pMapAddress);
+
+    if (pRequest->pSrcTexture && TinyImageFormat_IsCompressed((TinyImageFormat)pRequest->pSrcTexture->mFormat))
+    {
+        LOGF(eERROR, "Cannot readback compressed textures, provided format is %s", TinyImageFormat_Name((TinyImageFormat)pRequest->pSrcTexture->mFormat));
+        return false;
+    }
+
+    bool successfulRead = false;
+
+    if (pRequest->sType == RESOURCE_READBACK_TEXTURE)
+    {
+        // Copy out of the staging texture and into the map target.
+        DECLARE_ZERO(D3D11_MAPPED_SUBRESOURCE, mapping);
+        if (pRenderer->pDxContext->Map(pRequest->pStagingResource, 0, D3D11_MAP_READ, 0, &mapping) == S_OK)
+        {
+            D3D11_RESOURCE_DIMENSION texType;
+            pRequest->pStagingResource->GetType(&texType);
+
+            const uint32_t mipWidth = MIPLEVEL_DIM(pRequest->pSrcTexture->mWidth, pRequest->mLevel, pRequest->pSrcTexture->mMipLevels);
+            const uint32_t mipHeight = MIPLEVEL_DIM(pRequest->pSrcTexture->mHeight, pRequest->mLevel, pRequest->pSrcTexture->mMipLevels);
+            const uint32_t mipDepth = MIPLEVEL_DIM(pRequest->pSrcTexture->mDepth, pRequest->mLevel, pRequest->pSrcTexture->mMipLevels);
+            const uint32_t blockBitSize = TinyImageFormat_BitSizeOfBlock((TinyImageFormat)pRequest->pSrcTexture->mFormat);
+
+            // NOTE: bits -> bytes conversion on the cpuRowSize
+            const uint32_t cpuRowSize = (blockBitSize * mipWidth) / 8u;
+
+            switch (texType)
+            {
+                case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+                {
+                    memcpy(pRequest->pDestBuffer->pCpuMappedAddress, mapping.pData, min<size_t>(cpuRowSize, bufferSize));
+                    break;
+                }
+                case D3D11_RESOURCE_DIMENSION_TEXTURE2D: {
+                    for (uint32_t row = 0, bytesRead = 0; row < mipHeight && bytesRead + cpuRowSize <= bufferSize; ++row, bytesRead += cpuRowSize)
+                    {
+                        memcpy((unsigned char*)pMapAddress + row * cpuRowSize, 
+                            (unsigned char*)mapping.pData + row * mapping.RowPitch, 
+                            cpuRowSize);
+                    }
+                    break;
+                }
+                case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+                {
+                    const uint32_t numZ = MIPLEVEL_DIM(pRequest->pSrcTexture->mDepth, pRequest->mLevel, pRequest->pSrcTexture->mMipLevels);
+                    uint64_t bytesRead = 0;
+                    for (uint32_t zLayer = 0; zLayer < numZ; ++zLayer)
+                    {
+                        for (uint32_t row = 0; row < mipHeight && bytesRead + cpuRowSize <= bufferSize; ++row, bytesRead += cpuRowSize)
+                        {
+                            memcpy((unsigned char*)pMapAddress + (mipHeight * zLayer * cpuRowSize) + (row * cpuRowSize), 
+                                (unsigned char*)mapping.pData + (zLayer * mapping.DepthPitch) + (row * mapping.RowPitch), 
+                                cpuRowSize);
+                        }
+                    }
+                    break;
+                }
+            }
+            successfulRead = true;
+        }
+    }
+    else
+    {
+        // D3D11 doesn't support persistent mapping
+        mapBuffer(pRenderer, pRequest->pDestBuffer, NULL);
+        if (pRequest->pDestBuffer->pCpuMappedAddress)
+        {
+            memcpy(pMapAddress, pRequest->pDestBuffer->pCpuMappedAddress, min<size_t>(bufferSize, pRequest->pDestBuffer->mSize));
+            successfulRead = true;
+        }
+        unmapBuffer(pRenderer, pRequest->pDestBuffer);
+    }
+
+    return successfulRead;
+}
+
+void freeReadback(ResourceReadback* pRequest)
+{
+    ASSERT(pRequest);
+    
+    // release the staging resource if one was created
+    SAFE_RELEASE(pRequest->pStagingResource);
+}
+
+uint64_t getTextureReadbackSize(Renderer* pRenderer, Texture* pReadingTexture, uint32_t mipLevel, uint32_t layer)
+{
+    ASSERT(pRenderer);
+    ASSERT(pReadingTexture);
+    ASSERT(pReadingTexture->pDxResource);
+
+    const uint32_t mipWidth = MIPLEVEL_DIM(pReadingTexture->mWidth, mipLevel, pReadingTexture->mMipLevels);
+    const uint32_t mipHeight = MIPLEVEL_DIM(pReadingTexture->mWidth, mipLevel, pReadingTexture->mMipLevels);
+    const uint32_t mipDepth = MIPLEVEL_DIM(pReadingTexture->mWidth, mipLevel, pReadingTexture->mMipLevels);
+    const uint32_t blockByteSize = TinyImageFormat_BitSizeOfBlock((TinyImageFormat)pReadingTexture->mFormat) / 8u;
+
+    // D3D11 doesn't actually need this because of staging texture, for completeness
+    return mipDepth * mipHeight * mipWidth * blockByteSize;
+}
+
 #endif
 #endif
