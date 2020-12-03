@@ -4860,6 +4860,8 @@ bool getReadbackData(Renderer* pRenderer, ResourceReadback* pRequest, void* pMap
                 }
             }
             successfulRead = true;
+
+            pRenderer->pDxContext->Unmap(pRequest->pStagingResource, 0);
         }
     }
     else
